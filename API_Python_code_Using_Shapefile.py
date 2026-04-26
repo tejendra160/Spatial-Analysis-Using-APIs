@@ -1,0 +1,336 @@
+# ============================================================
+# NASA POWER Hydrology Data Using Study Area Shapefile
+# Output:
+# 1. Daily watershed mean CSV
+# 2. Annual/monthly summary CSV
+# 3. Time-series plots
+# ============================================================
+
+import os
+import time
+import requests
+import pandas as pd
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from shapely.geometry import Point
+
+# --------------------------------------------------
+# 1. User settings
+# --------------------------------------------------
+
+study_area_shapefile = r"C:\Users\tejen\OneDrive - University of Virginia\Rivanna_data\Watershed22\W22_gis_data\W22_shapefile\W22.shp"
+
+start_date = "20200101"
+end_date = "20201231"
+
+output_dir = r"C:\Users\tejen\OneDrive - University of Virginia\Research\NASA_POWER_W22"
+os.makedirs(output_dir, exist_ok=True)
+
+output_daily_csv = os.path.join(output_dir, "W22_NASA_POWER_daily_mean.csv")
+output_monthly_csv = os.path.join(output_dir, "W22_NASA_POWER_monthly_summary.csv")
+output_annual_csv = os.path.join(output_dir, "W22_NASA_POWER_annual_summary.csv")
+
+output_precip_plot = os.path.join(output_dir, "W22_daily_precipitation_timeseries.png")
+output_temp_plot = os.path.join(output_dir, "W22_daily_temperature_timeseries.png")
+output_monthly_plot = os.path.join(output_dir, "W22_monthly_precipitation_temperature.png")
+
+# NASA POWER daily API
+url = "https://power.larc.nasa.gov/api/temporal/daily/point"
+
+parameters = [
+    "PRECTOTCORR",  # precipitation, mm/day
+    "T2M",          # mean temperature, Celsius
+    "T2M_MAX",      # max temperature, Celsius
+    "T2M_MIN"       # min temperature, Celsius
+]
+
+# Grid spacing in degrees
+# 0.05 degree is about 5 km
+# NASA POWER data is coarse, so this is usually enough
+grid_spacing = 0.05
+
+
+# --------------------------------------------------
+# 2. Read shapefile
+# --------------------------------------------------
+
+study_area = gpd.read_file(study_area_shapefile)
+
+# Convert to WGS84 because NASA POWER needs lat/lon
+study_area = study_area.to_crs(epsg=4326)
+
+# Dissolve all polygons into one watershed boundary
+study_area_poly = study_area.geometry.unary_union
+
+print("Study area loaded successfully")
+print(f"CRS: {study_area.crs}")
+print(f"Bounds: {study_area.total_bounds}")
+
+
+# --------------------------------------------------
+# 3. Create sample points inside shapefile
+# --------------------------------------------------
+
+minx, miny, maxx, maxy = study_area.total_bounds
+
+points = []
+
+x = minx
+while x <= maxx:
+    y = miny
+    while y <= maxy:
+        p = Point(x, y)
+        if study_area_poly.contains(p):
+            points.append(p)
+        y += grid_spacing
+    x += grid_spacing
+
+# If watershed is small and no grid point falls inside,
+# use centroid as fallback
+if len(points) == 0:
+    print("No grid points found inside shapefile. Using watershed centroid.")
+    points = [study_area_poly.centroid]
+
+points_gdf = gpd.GeoDataFrame(geometry=points, crs="EPSG:4326")
+
+print(f"Number of NASA POWER sample points: {len(points_gdf)}")
+
+
+# --------------------------------------------------
+# 4. Function to download NASA POWER data for one point
+# --------------------------------------------------
+
+def get_nasa_power_data(latitude, longitude, point_id):
+    params = {
+        "parameters": ",".join(parameters),
+        "community": "AG",
+        "longitude": longitude,
+        "latitude": latitude,
+        "start": start_date,
+        "end": end_date,
+        "format": "JSON"
+    }
+
+    response = requests.get(url, params=params, timeout=60)
+    response.raise_for_status()
+
+    data = response.json()
+    parameter_data = data["properties"]["parameter"]
+
+    df = pd.DataFrame(parameter_data)
+
+    df.index = pd.to_datetime(df.index, format="%Y%m%d")
+    df.index.name = "date"
+
+    df = df.rename(columns={
+        "PRECTOTCORR": "precipitation_mm_day",
+        "T2M": "temperature_mean_c",
+        "T2M_MAX": "temperature_max_c",
+        "T2M_MIN": "temperature_min_c"
+    })
+
+    df["point_id"] = point_id
+    df["latitude"] = latitude
+    df["longitude"] = longitude
+
+    return df
+
+
+# --------------------------------------------------
+# 5. Download data for all points
+# --------------------------------------------------
+
+all_point_data = []
+
+for i, row in points_gdf.iterrows():
+    lon = row.geometry.x
+    lat = row.geometry.y
+
+    print(f"Downloading point {i + 1}/{len(points_gdf)}: lat={lat:.4f}, lon={lon:.4f}")
+
+    try:
+        df_point = get_nasa_power_data(lat, lon, i + 1)
+        all_point_data.append(df_point)
+
+        # Small pause to be polite to the API
+        time.sleep(0.5)
+
+    except Exception as e:
+        print(f"Failed for point {i + 1}: {e}")
+
+if len(all_point_data) == 0:
+    raise RuntimeError("No NASA POWER data was downloaded.")
+
+
+# --------------------------------------------------
+# 6. Combine all point data
+# --------------------------------------------------
+
+df_all = pd.concat(all_point_data)
+
+all_points_csv = os.path.join(output_dir, "W22_NASA_POWER_all_sample_points.csv")
+df_all.to_csv(all_points_csv)
+
+print(f"Saved all sample-point data: {all_points_csv}")
+
+
+# --------------------------------------------------
+# 7. Calculate watershed mean daily time series
+# --------------------------------------------------
+
+df_daily_mean = df_all.groupby(df_all.index).agg({
+    "precipitation_mm_day": "mean",
+    "temperature_mean_c": "mean",
+    "temperature_max_c": "mean",
+    "temperature_min_c": "mean"
+})
+
+df_daily_mean.index.name = "date"
+
+df_daily_mean.to_csv(output_daily_csv)
+print(f"Saved daily watershed mean CSV: {output_daily_csv}")
+
+
+# --------------------------------------------------
+# 8. Hydrological summaries
+# --------------------------------------------------
+
+annual_summary = pd.DataFrame({
+    "annual_precipitation_mm": [df_daily_mean["precipitation_mm_day"].sum()],
+    "mean_temperature_c": [df_daily_mean["temperature_mean_c"].mean()],
+    "mean_max_temperature_c": [df_daily_mean["temperature_max_c"].mean()],
+    "mean_min_temperature_c": [df_daily_mean["temperature_min_c"].mean()],
+    "wet_days_greater_than_1mm": [(df_daily_mean["precipitation_mm_day"] > 1).sum()],
+    "max_daily_precipitation_mm": [df_daily_mean["precipitation_mm_day"].max()]
+})
+
+annual_summary.to_csv(output_annual_csv, index=False)
+
+monthly_summary = df_daily_mean.resample("M").agg({
+    "precipitation_mm_day": "sum",
+    "temperature_mean_c": "mean",
+    "temperature_max_c": "mean",
+    "temperature_min_c": "mean"
+})
+
+monthly_summary = monthly_summary.rename(columns={
+    "precipitation_mm_day": "monthly_precipitation_mm",
+    "temperature_mean_c": "monthly_mean_temperature_c",
+    "temperature_max_c": "monthly_mean_max_temperature_c",
+    "temperature_min_c": "monthly_mean_min_temperature_c"
+})
+
+monthly_summary.to_csv(output_monthly_csv)
+
+print("\nHydrological summary")
+print("---------------------")
+print(f"Annual precipitation: {annual_summary.loc[0, 'annual_precipitation_mm']:.2f} mm")
+print(f"Mean temperature: {annual_summary.loc[0, 'mean_temperature_c']:.2f} °C")
+print(f"Wet days > 1 mm: {annual_summary.loc[0, 'wet_days_greater_than_1mm']}")
+print(f"Maximum daily precipitation: {annual_summary.loc[0, 'max_daily_precipitation_mm']:.2f} mm")
+
+
+# --------------------------------------------------
+# 9. Plot daily precipitation
+# --------------------------------------------------
+
+plt.figure(figsize=(14, 5))
+
+plt.plot(
+    df_daily_mean.index,
+    df_daily_mean["precipitation_mm_day"],
+    linewidth=1.2
+)
+
+plt.title("Daily Precipitation from NASA POWER\nWatershed Mean", fontsize=15, fontweight="bold")
+plt.xlabel("Date", fontsize=12)
+plt.ylabel("Precipitation (mm/day)", fontsize=12)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(output_precip_plot, dpi=300)
+plt.show()
+
+print(f"Saved precipitation plot: {output_precip_plot}")
+
+
+# --------------------------------------------------
+# 10. Plot daily temperature
+# --------------------------------------------------
+
+plt.figure(figsize=(14, 5))
+
+plt.plot(
+    df_daily_mean.index,
+    df_daily_mean["temperature_mean_c"],
+    label="Mean temperature",
+    linewidth=1.5
+)
+
+plt.plot(
+    df_daily_mean.index,
+    df_daily_mean["temperature_max_c"],
+    label="Maximum temperature",
+    linewidth=1.0,
+    alpha=0.7
+)
+
+plt.plot(
+    df_daily_mean.index,
+    df_daily_mean["temperature_min_c"],
+    label="Minimum temperature",
+    linewidth=1.0,
+    alpha=0.7
+)
+
+plt.title("Daily Temperature from NASA POWER\nWatershed Mean", fontsize=15, fontweight="bold")
+plt.xlabel("Date", fontsize=12)
+plt.ylabel("Temperature (°C)", fontsize=12)
+plt.legend(frameon=False)
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.savefig(output_temp_plot, dpi=300)
+plt.show()
+
+print(f"Saved temperature plot: {output_temp_plot}")
+
+
+# --------------------------------------------------
+# 11. Plot monthly precipitation and temperature
+# --------------------------------------------------
+
+fig, ax1 = plt.subplots(figsize=(12, 5))
+
+ax1.bar(
+    monthly_summary.index,
+    monthly_summary["monthly_precipitation_mm"],
+    width=20,
+    alpha=0.7,
+    label="Monthly precipitation"
+)
+
+ax1.set_ylabel("Monthly Precipitation (mm)", fontsize=12)
+ax1.set_xlabel("Month", fontsize=12)
+
+ax2 = ax1.twinx()
+
+ax2.plot(
+    monthly_summary.index,
+    monthly_summary["monthly_mean_temperature_c"],
+    marker="o",
+    linewidth=2,
+    label="Mean temperature"
+)
+
+ax2.set_ylabel("Mean Temperature (°C)", fontsize=12)
+
+plt.title("Monthly Precipitation and Temperature\nWatershed Mean from NASA POWER", fontsize=15, fontweight="bold")
+
+ax1.grid(True, alpha=0.3)
+
+fig.tight_layout()
+plt.savefig(output_monthly_plot, dpi=300)
+plt.show()
+
+print(f"Saved monthly plot: {output_monthly_plot}")
+
+print("\nAll outputs saved successfully.")
